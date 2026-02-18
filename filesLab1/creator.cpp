@@ -1,101 +1,91 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <iostream>
-#include <fstream>
-#include <string>
-#include <limits>
+#include <cstdlib>
 #include <cstring>
+#include <windows.h>
 #include "employee.h"
 
-using std::string;
 using std::cout;
-using std::cerr;
 using std::cin;
+using std::cerr;
 using std::endl;
 
 int main(int argc, char* argv[]) {
-    std::ofstream file;
-
     try {
         if (argc != 3) {
-            throw ValidationException(
-                "Usage: Creator.exe <filename> <count>");
+            cerr << "Usage: Creator.exe <filename> <record_count>" << endl;
+            return 1;
         }
 
-        string fileName = argv[1];
-        int count = parseRecordCount(argv[2]);
+        char* fileName = argv[1];
+        int count = atoi(argv[2]);
 
-        file.open(fileName, std::ios::binary | std::ios::trunc);
-
-        if (!file.is_open()) {
-            throw FileException("Cannot create file: " + fileName);
+        if (count <= 0) {
+            cerr << "Error: record count must be positive." << endl;
+            return 1;
         }
+
+        HANDLE hFile = CreateFileA(
+            fileName,              // имя файла
+            GENERIC_WRITE,         // доступ на запись
+            0,                     // без совместного доступа
+            NULL,                  // безопасность по умолчанию
+            CREATE_ALWAYS,         // создать новый 
+            FILE_ATTRIBUTE_NORMAL, // обычный файл
+            NULL                   // без шаблона
+        );
+
+        if (hFile == INVALID_HANDLE_VALUE) {
+            cerr << "Error: cannot create file '" << fileName
+                << "'. Code: " << GetLastError() << endl;
+            return 1;
+        }
+
+        cout << "Enter " << count << " employee records:\n" << endl;
 
         for (int i = 0; i < count; ++i) {
-            employee emp{};
+            employee emp;
+            memset(&emp, 0, sizeof(employee));
 
-            cout << "Employee " << i + 1 << endl;
+            cout << "Record " << (i + 1) << ":" << endl;
 
-            cout << "  num: ";
-            string input;
-            if (!(cin >> input)) {
-                throw ValidationException("Failed to read employee number");
+            cout << "  ID: ";
+            cin >> emp.num;
+            if (cin.fail()) {
+                cerr << "Error: invalid ID." << endl;
+                CloseHandle(hFile);
+                return 1;
             }
-            emp.num = parseEmployeeId(input);
 
-            cout << "  name: ";
-            if (!(cin >> input)) {
-                throw ValidationException("Failed to read employee name");
+            cout << "  Name (max 9 chars): ";
+            cin >> emp.name;
+            emp.name[9] = '\0';
+
+            cout << "  Hours: ";
+            cin >> emp.hours;
+            if (cin.fail() || emp.hours < 0) {
+                cerr << "Error: invalid hours." << endl;
+                CloseHandle(hFile);
+                return 1;
             }
-            if (input.length() >= sizeof(emp.name)) {
-                throw ValidationException("Name too long (max 9 chars)");
-            }
-            strncpy(emp.name, input.c_str(), sizeof(emp.name) - 1);
-            emp.name[sizeof(emp.name) - 1] = '\0';
 
-            cout << "  hours: ";
-            if (!(cin >> input)) {
-                throw ValidationException("Failed to read hours");
-            }
-            emp.hours = parseHours(input);
-
-            file.write(reinterpret_cast<const char*>(&emp), sizeof(employee));
-
-            if (file.fail()) {
-                throw FileException("Failed to write record #" + std::to_string(i + 1));
+            DWORD bytesWritten;
+            if (!WriteFile(hFile, &emp, sizeof(employee), &bytesWritten, NULL)
+                || bytesWritten != sizeof(employee))
+            {
+                cerr << "Error: write failed. Code: " << GetLastError() << endl;
+                CloseHandle(hFile);
+                return 1;
             }
 
             cout << endl;
         }
 
-        file.close();
-        if (file.fail()) {
-            throw FileException("Error closing file (disk full?)");
-        }
-
-        cout << "File '" << fileName << "' created successfully ("
-            << count << " records)." << endl;
-    }
-    catch (const ValidationException& e) {
-        cerr << "Validation Error: " << e.what() << endl;
-        if (file.is_open()) {
-            file.close();
-        }
-        return 1;
-    }
-    catch (const FileException& e) {
-        cerr << "File Error: " << e.what() << endl;
-        if (file.is_open()) {
-            file.close();
-        }
-        return 2;
+        CloseHandle(hFile);
+        return 0;
     }
     catch (const std::exception& e) {
-        cerr << "Unexpected Error: " << e.what() << endl;
-        if (file.is_open()) {
-            file.close();
-        }
-        return 3;
+        cerr << "Error: " << e.what() << endl;
+        return 1;
     }
-
-    return 0;
 }

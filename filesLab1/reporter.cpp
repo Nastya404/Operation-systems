@@ -1,106 +1,99 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <iostream>
-#include <fstream>
-#include <string>
-#include <iomanip>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#include <windows.h>
 #include "employee.h"
 
 using std::cout;
 using std::cerr;
 using std::endl;
-using std::string;
-using std::ifstream;
-using std::ofstream;
-using std::ios;
 
 int main(int argc, char* argv[]) {
-    ifstream input;
-    ofstream report;
-
     try {
         if (argc != 4) {
-            throw ValidationException(
-                "Usage: Reporter.exe <input_file> <report_file> <hourly_pay>");
+            cerr << "Usage: Reporter.exe <input_file> <report_file> <hourly_pay>" << endl;
+            return 1;
         }
 
-        string inputFileName = argv[1];
-        string reportFileName = argv[2];
-        double pay = parsePositiveDouble(argv[3], "hourly pay", 0.01, 1000000.0);
+        char* inputFileName = argv[1];
+        char* reportFileName = argv[2];
+        double pay = atof(argv[3]);
 
-        input.open(inputFileName, ios::binary);
-        if (!input.is_open()) {
-            throw FileException("Cannot open input file: " + inputFileName);
+        if (pay <= 0) {
+            cerr << "Error: hourly pay must be positive." << endl;
+            return 1;
         }
 
-        report.open(reportFileName);
-        if (!report.is_open()) {
-            input.close();
-            throw FileException("Cannot create report file: " + reportFileName);
+        HANDLE hInput = CreateFileA(
+            inputFileName,
+            GENERIC_READ,
+            0,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL
+        );
+
+        if (hInput == INVALID_HANDLE_VALUE) {
+            cerr << "Error: cannot open '" << inputFileName
+                << "'. Code: " << GetLastError() << endl;
+            return 1;
         }
 
-        report << "Report for file " << inputFileName << endl;
-        report << std::setw(10) << "Number"
-            << std::setw(10) << "Name"
-            << std::setw(10) << "Hours"
-            << std::setw(12) << "Salary"
-            << endl;
-        report << string(42, '-') << endl;
+        HANDLE hReport = CreateFileA(
+            reportFileName,
+            GENERIC_WRITE,
+            0,
+            NULL,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL
+        );
 
-        if (report.fail()) {
-            throw FileException("Failed to write report header");
+        if (hReport == INVALID_HANDLE_VALUE) {
+            cerr << "Error: cannot create '" << reportFileName
+                << "'. Code: " << GetLastError() << endl;
+            CloseHandle(hInput); 
+            return 1;
         }
+
+        char line[512];
+        DWORD bytesWritten;
+
+        sprintf(line, "Report for file \"%s\"\r\n", inputFileName);
+        WriteFile(hReport, line, strlen(line), &bytesWritten, NULL);
+
+        sprintf(line, "%-10s %-10s %-10s %-10s\r\n",
+            "Number", "Name", "Hours", "Salary");
+        WriteFile(hReport, line, strlen(line), &bytesWritten, NULL);
 
         employee emp;
+        DWORD bytesRead;
         int recordCount = 0;
 
-        while (input.read(reinterpret_cast<char*>(&emp), sizeof(employee))) {
+        while (ReadFile(hInput, &emp, sizeof(employee), &bytesRead, NULL)
+            && bytesRead == sizeof(employee))
+        {
             double salary = emp.hours * pay;
 
-            report << std::setw(10) << emp.num
-                << std::setw(10) << emp.name
-                << std::setw(10) << std::fixed << std::setprecision(1) << emp.hours
-                << std::setw(12) << std::fixed << std::setprecision(2) << salary
-                << endl;
+            sprintf(line, "%-10d %-10s %-10.1f %-10.2f\r\n",
+                emp.num, emp.name, emp.hours, salary);
+            WriteFile(hReport, line, strlen(line), &bytesWritten, NULL);
 
-            if (report.fail()) {
-                throw FileException(
-                    "Failed to write record #" + std::to_string(recordCount + 1));
-            }
             ++recordCount;
         }
 
-        if (input.bad()) {
-            throw FileException("Error reading input file");
-        }
+        CloseHandle(hReport);
+        CloseHandle(hInput);
 
-        if (recordCount == 0) {
-            cerr << "Input file is empty." << endl;
-        }
-
-        report.close();
-        if (report.fail()) {
-            throw FileException("Error closing report file (disk full?)");
-        }
-
-        input.close();
+        cout << "Report '" << reportFileName << "' created ("
+            << recordCount << " records)." << endl;
         return 0;
     }
-    catch (const FileException& e) {
-        cerr << "File Error: " << e.what() << endl;
-        if (input.is_open()) input.close();
-        if (report.is_open()) report.close();
-        return 1;
-    }
-    catch (const ValidationException& e) {
-        cerr << "Validation Error: " << e.what() << endl;
-        if (input.is_open()) input.close();
-        if (report.is_open()) report.close();
-        return 2;
-    }
     catch (const std::exception& e) {
-        cerr << "Unexpected Error: " << e.what() << endl;
-        if (input.is_open()) input.close();
-        if (report.is_open()) report.close();
-        return 3;
+        cerr << "Error: " << e.what() << endl;
+        return 1;
     }
 }

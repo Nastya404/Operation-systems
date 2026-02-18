@@ -1,8 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <iostream>
-#include <fstream>
-#include <string>
-#define NOMINMAX
+#include <cstring>
 #include <windows.h>
 #include "employee.h"
 
@@ -10,154 +8,148 @@ using std::cout;
 using std::cin;
 using std::cerr;
 using std::endl;
-using std::string;
-using std::ifstream;
-using std::ios;
 
 bool runProcess(const char* commandLine) {
     char cmd[512];
-    strncpy(cmd, commandLine, sizeof(cmd) - 1);
-    cmd[sizeof(cmd) - 1] = '\0';
+    sprintf_s(cmd, sizeof(cmd), "%s", commandLine);
 
-    STARTUPINFO si;
+    STARTUPINFOA si;
     PROCESS_INFORMATION pi;
-
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
 
-    if (!CreateProcess(
-        NULL,
-        cmd,
-        NULL,
-        NULL,
-        FALSE,
-        CREATE_NEW_CONSOLE,
-        NULL,
-        NULL,
-        &si,
-        &pi))
+    if (!CreateProcessA(
+        NULL,               // lpApplicationName
+        cmd,                // lpCommandLine: командная строка целиком
+        NULL,               // lpProcessAttributes: безопасность процесса
+        NULL,               // lpThreadAttributes: безопасность потока
+        FALSE,              // bInheritHandles: не наследовать дескрипторы
+        CREATE_NEW_CONSOLE, // dwCreationFlags: новое окно консоли
+        NULL,               // lpEnvironment
+        NULL,               // lpCurrentDirectory
+        &si,                // lpStartupInfo: настройки запуска
+        &pi))               // lpProcessInformation: инфо о процессе
     {
-        DWORD error = GetLastError();
-        cerr << "CreateProcess failed. Error code: " << error << endl;
+        cerr << "CreateProcess failed. Error: " << GetLastError() << endl;
         return false;
     }
 
     WaitForSingleObject(pi.hProcess, INFINITE);
 
-    DWORD exitCode;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
-    return (exitCode == 0);
-}
-
-bool safeReadString(string& str) {
-    if (!(cin >> str)) {
-        cin.clear();
-        cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-        return false;
-    }
     return true;
 }
 
 int main() {
-    try {
-        string fileName;
-        string reportName;
-        string input;
+    char filename[256];
+    char reportName[256];
 
-        cout << "Enter binary file name: ";
-        if (!safeReadString(fileName)) {
-            throw ValidationException("Failed to read file name");
-        }
-
-        cout << "Enter number of employees: ";
-        if (!safeReadString(input)) {
-            throw ValidationException("Failed to read employee count");
-        }
-        int amount = parseRecordCount(input);
-
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd), "Creator.exe %s %d", fileName.c_str(), amount);
-
-        cout << "\nStarting Creator..." << endl;
-        if (!runProcess(cmd)) {
-            throw FileException("Creator failed or exited with error");
-        }
-
-        ifstream file(fileName, ios::binary);
-        if (!file.is_open()) {
-            throw FileException("Cannot open file: " + fileName);
-        }
-
-        employee emp;
-        cout << "\n--- File contents ---" << endl;
-        int count = 0;
-        while (file.read(reinterpret_cast<char*>(&emp), sizeof(employee))) {
-            cout << emp.num << " " << emp.name << " " << emp.hours << endl;
-            ++count;
-        }
-
-        if (file.bad()) {
-            file.close();
-            throw FileException("Error reading file: " + fileName);
-        }
-        file.close();
-
-        if (count == 0) {
-            cerr << "Warning: file is empty" << endl;
-        }
-
-        cout << "\nEnter report file name: ";
-        if (!safeReadString(reportName)) {
-            throw ValidationException("Failed to read report file name");
-        }
-
-        cout << "Enter hourly pay: ";
-        if (!safeReadString(input)) {
-            throw ValidationException("Failed to read hourly pay");
-        }
-        double salary = parsePositiveDouble(input, "hourly pay", 0.01, 1000000.0);
-
-        snprintf(cmd, sizeof(cmd), "Reporter.exe %s %s %.2f",
-            fileName.c_str(), reportName.c_str(), salary);
-
-        if (!runProcess(cmd)) {
-            throw FileException("Reporter failed or exited with error");
-        }
-
-        ifstream report(reportName);
-        if (!report.is_open()) {
-            throw FileException("Cannot open report: " + reportName);
-        }
-
-        string line;
-        cout << "\n--- Report ---" << endl;
-        while (std::getline(report, line)) {
-            cout << line << endl;
-        }
-
-        if (report.bad()) {
-            report.close();
-            throw FileException("Error reading report: " + reportName);
-        }
-        report.close();
-
-        return 0;
-    }
-    catch (const FileException& e) {
-        cerr << "File Error: " << e.what() << endl;
+    cout << "Enter binary file name: ";
+    cin >> filename;
+    if (cin.fail() || strlen(filename) == 0) {
+        cerr << "Error: invalid file name." << endl;
         return 1;
     }
-    catch (const ValidationException& e) {
-        cerr << "Validation Error: " << e.what() << endl;
-        return 2;
+
+    cout << "Enter number of records: ";
+    int count;
+    cin >> count;
+    if (cin.fail() || count <= 0) {
+        cerr << "Error: count must be a positive number." << endl;
+        return 1;
     }
-    catch (const std::exception& e) {
-        cerr << "Unexpected Error: " << e.what() << endl;
-        return 3;
+
+    char cmd[512];
+    sprintf_s(cmd, sizeof(cmd), "Creator.exe %s %d", filename, count);
+
+    if (!runProcess(cmd)) {
+        cerr << "Error: failed to start Creator." << endl;
+        return 1;
     }
+
+    HANDLE hFile = CreateFileA(
+        filename,              // lpFileName: имя файла
+        GENERIC_READ,          // dwDesiredAccess: доступ на чтение
+        0,                     // dwShareMode: без совместного доступа
+        NULL,                  // lpSecurityAttributes: по умолчанию
+        OPEN_EXISTING,         // dwCreationDisposition: файл должен существовать
+        FILE_ATTRIBUTE_NORMAL, // dwFlagsAndAttributes: обычный файл
+        NULL                   // hTemplateFile: без шаблона
+    );
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+        cerr << "Error: cannot open '" << filename
+            << "'. Code: " << GetLastError() << endl;
+        return 1;
+    }
+
+    employee emp;
+    DWORD bytesRead;
+
+    cout << "\n--- Binary file contents ---" << endl;
+    while (ReadFile(hFile, &emp, sizeof(emp), &bytesRead, NULL)
+        && bytesRead == sizeof(emp))
+    {
+        cout << emp.num << " "
+            << emp.name << " "
+            << emp.hours << endl;
+    }
+
+    CloseHandle(hFile);
+
+
+    cout << "\nEnter report file name: ";
+    cin >> reportName;
+    if (cin.fail() || strlen(reportName) == 0) {
+        cerr << "Error: invalid report file name." << endl;
+        return 1;
+    }
+
+    cout << "Enter hourly pay: ";
+    double pay;
+    cin >> pay;
+    if (cin.fail() || pay <= 0) {
+        cerr << "Error: pay must be a positive number." << endl;
+        return 1;
+    }
+
+    sprintf_s(cmd, sizeof(cmd), "Reporter.exe %s %s %.2f",
+        filename, reportName, pay);
+
+    if (!runProcess(cmd)) {
+        cerr << "Error: failed to start Reporter." << endl;
+        return 1;
+    }
+
+    HANDLE hReport = CreateFileA(
+        reportName,
+        GENERIC_READ,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
+    if (hReport == INVALID_HANDLE_VALUE) {
+        cerr << "Error: cannot open report '" << reportName
+            << "'. Code: " << GetLastError() << endl;
+        return 1;
+    }
+
+    char buffer[256];
+    cout << "\n--- Report ---" << endl;
+    while (ReadFile(hReport, buffer, sizeof(buffer) - 1, &bytesRead, NULL)
+        && bytesRead > 0)
+    {
+        buffer[bytesRead] = '\0';
+        cout << buffer;
+    }
+
+    CloseHandle(hReport);
+
+    return 0;
 }
