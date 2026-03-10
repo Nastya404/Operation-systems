@@ -1,0 +1,22 @@
+# Build
+build/
+x64/
+Debug/
+Release/
+
+# Visual Studio
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.suo
+*.user
+*.db
+*.opendb
+*.ipch
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
