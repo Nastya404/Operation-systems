@@ -1,207 +1,162 @@
-#include "headers/sharedQueue.h"
+#include "SharedQueue.h"
 #include <algorithm>
 
 SharedQueue::SharedQueue()
-    : hFile_(INVALID_HANDLE_VALUE),
-      hMap_(NULL),
-      baseView_(NULL),
-      mappedSize_(0),
-      slots_(NULL),
-      hMutex_(NULL),
-      hSemEmpty_(NULL),
-      hSemFull_(NULL),
-      hAllReadyEvent_(NULL)
-{
+    : fileHandle(INVALID_HANDLE_VALUE)
+    , mappingHandle(NULL)
+    , viewPtr(NULL)
+    , viewSize(0)
+    , messageSlots(NULL)
+    , syncMutex(NULL)
+    , semFreeSlots(NULL)
+    , semUsedSlots(NULL)
+    , allReadyEvent(NULL) {
 }
 
-SharedQueue::~SharedQueue()
-{
-    CloseAll();
+SharedQueue::~SharedQueue() {
+    releaseResources();
 }
 
-std::string MakeObjectBaseName(const std::string &fileName)
-{
-    std::string base;
-    base.reserve(fileName.size());
-    for (size_t i = 0; i < fileName.size(); ++i)
-    {
-        char c = fileName[i];
-        if (c == '\\' || c == '/' || c == ':')
-            base.push_back('_');
-        else
-            base.push_back(c);
+static std::string sanitizeFileName(const std::string& fileName) {
+    std::string result;
+    result.reserve(fileName.size());
+    for (size_t i = 0; i < fileName.size(); i++) {
+        char ch = fileName[i];
+        bool isSeparator = (ch == '\\' || ch == '/' || ch == ':');
+        result.push_back(isSeparator ? '_' : ch);
     }
-    return base;
+    return result;
 }
 
-std::string MakeNamedObject(const std::string &base, const std::string &suffix)
-{
-    return std::string("IPC_") + base + "_" + suffix;
+static std::string buildObjectName(const std::string& baseName, const std::string& suffix) {
+    return "IPC_" + baseName + "_" + suffix;
 }
 
-void SharedQueue::CloseAll()
-{
-    if (baseView_)
-    {
-        UnmapViewOfFile(baseView_);
-        baseView_ = NULL;
-        slots_ = NULL;
-        mappedSize_ = 0;
+void SharedQueue::releaseResources() {
+    if (viewPtr != NULL) {
+        UnmapViewOfFile(viewPtr);
+        viewPtr = NULL;
+        messageSlots = NULL;
+        viewSize = 0;
     }
-    if (hMap_)
-    {
-        CloseHandle(hMap_);
-        hMap_ = NULL;
+
+    if (mappingHandle != NULL) {
+        CloseHandle(mappingHandle);
+        mappingHandle = NULL;
     }
-    if (hFile_ != INVALID_HANDLE_VALUE)
-    {
-        CloseHandle(hFile_);
-        hFile_ = INVALID_HANDLE_VALUE;
+
+    if (fileHandle != INVALID_HANDLE_VALUE) {
+        CloseHandle(fileHandle);
+        fileHandle = INVALID_HANDLE_VALUE;
     }
-    if (hMutex_)
-    {
-        CloseHandle(hMutex_);
-        hMutex_ = NULL;
-    }
-    if (hSemEmpty_)
-    {
-        CloseHandle(hSemEmpty_);
-        hSemEmpty_ = NULL;
-    }
-    if (hSemFull_)
-    {
-        CloseHandle(hSemFull_);
-        hSemFull_ = NULL;
-    }
-    if (hAllReadyEvent_)
-    {
-        CloseHandle(hAllReadyEvent_);
-        hAllReadyEvent_ = NULL;
-    }
+
+    if (syncMutex != NULL) { CloseHandle(syncMutex);    syncMutex = NULL; }
+    if (semFreeSlots != NULL) { CloseHandle(semFreeSlots); semFreeSlots = NULL; }
+    if (semUsedSlots != NULL) { CloseHandle(semUsedSlots); semUsedSlots = NULL; }
+    if (allReadyEvent != NULL) { CloseHandle(allReadyEvent);allReadyEvent = NULL; }
 }
 
-bool SharedQueue::MapFile(const std::string &path, bool create, unsigned int capacity)
-{
-    DWORD access = GENERIC_READ | GENERIC_WRITE;
-    DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE;
-    DWORD disp = create ? CREATE_ALWAYS : OPEN_EXISTING;
+bool SharedQueue::openMappedFile(const std::string& path, bool createNew, unsigned int capacity) {
+    DWORD disposition = createNew ? CREATE_ALWAYS : OPEN_EXISTING;
 
-    hFile_ = CreateFileA(path.c_str(), access, share, NULL, disp, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile_ == INVALID_HANDLE_VALUE)
-    {
+    fileHandle = CreateFileA(
+        path.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        disposition,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
+    if (fileHandle == INVALID_HANDLE_VALUE) {
         PrintLastErrorA("Create/Open file failed");
         return false;
     }
 
-    DWORD totalSize;
-    if (create)
-    {
-        totalSize = (DWORD)(HEADER_BINARY_SIZE + capacity * sizeof(MessageSlot));
+    DWORD totalBytes;
+
+    if (createNew) {
+        totalBytes = (DWORD)(HEADER_BINARY_SIZE + capacity * sizeof(MessageSlot));
     }
-    else
-    {
-        LARGE_INTEGER sz;
-        if (!GetFileSizeEx(hFile_, &sz))
-        {
+    else {
+        LARGE_INTEGER fileSize;
+        if (!GetFileSizeEx(fileHandle, &fileSize)) {
             PrintLastErrorA("GetFileSizeEx");
             return false;
         }
-        totalSize = (DWORD)sz.QuadPart;
-        if (totalSize < HEADER_BINARY_SIZE)
-        {
-            printf("[SharedQueue] Invalid file size\n");
+        totalBytes = (DWORD)fileSize.QuadPart;
+        if (totalBytes < HEADER_BINARY_SIZE) {
+            printf("[SharedQueue] file is too small to contain a valid header\n");
             return false;
         }
     }
 
-    hMap_ = CreateFileMappingA(hFile_, NULL, PAGE_READWRITE, 0, totalSize, NULL);
-    if (!hMap_)
-    {
+    mappingHandle = CreateFileMappingA(fileHandle, NULL, PAGE_READWRITE, 0, totalBytes, NULL);
+    if (mappingHandle == NULL) {
         PrintLastErrorA("CreateFileMapping");
         return false;
     }
 
-    baseView_ = (unsigned char *)MapViewOfFile(hMap_, FILE_MAP_ALL_ACCESS, 0, 0, 0);
-    if (!baseView_)
-    {
+    viewPtr = (unsigned char*)MapViewOfFile(mappingHandle, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+    if (viewPtr == NULL) {
         PrintLastErrorA("MapViewOfFile");
         return false;
     }
-    mappedSize_ = totalSize;
-    slots_ = (MessageSlot *)(baseView_ + HEADER_BINARY_SIZE);
+
+    viewSize = totalBytes;
+    messageSlots = (MessageSlot*)(viewPtr + HEADER_BINARY_SIZE);
     return true;
 }
 
-void SharedQueue::ReadHeader(QueueHeaderBinary &out) const
-{
-    const unsigned char *p = baseView_;
-    const unsigned int *pu = reinterpret_cast<const unsigned int *>(p);
-    out.capacity = pu[0];
-    out.msgLen = pu[1];
-    out.readIndex = pu[2];
-    out.writeIndex = pu[3];
-    out.senderReadyCount = pu[4];
-    out.expectedSenders = pu[5];
-    out.shuttingDown = p[24];
-    out.reserved[0] = p[25];
-    out.reserved[1] = p[26];
-    out.reserved[2] = p[27];
+void SharedQueue::readHeader(QueueHeader& out) const {
+    const unsigned int* fields = reinterpret_cast<const unsigned int*>(viewPtr);
+    out.capacity = fields[0];
+    out.msgLen = fields[1];
+    out.readIndex = fields[2];
+    out.writeIndex = fields[3];
+    out.senderReadyCount = fields[4];
+    out.expectedSenders = fields[5];
+    out.shuttingDown = viewPtr[24];
+    out.reserved[0] = viewPtr[25];
+    out.reserved[1] = viewPtr[26];
+    out.reserved[2] = viewPtr[27];
 }
 
-void SharedQueue::WriteHeader(const QueueHeaderBinary &hdr)
-{
-    unsigned char *p = baseView_;
-    unsigned int *pu = (unsigned int *)p;
-    pu[0] = hdr.capacity;
-    pu[1] = hdr.msgLen;
-    pu[2] = hdr.readIndex;
-    pu[3] = hdr.writeIndex;
-    pu[4] = hdr.senderReadyCount;
-    pu[5] = hdr.expectedSenders;
-    p[24] = hdr.shuttingDown;
-    p[25] = hdr.reserved[0];
-    p[26] = hdr.reserved[1];
-    p[27] = hdr.reserved[2];
+void SharedQueue::writeHeader(const QueueHeader& hdr) {
+    unsigned int* fields = reinterpret_cast<unsigned int*>(viewPtr);
+    fields[0] = hdr.capacity;
+    fields[1] = hdr.msgLen;
+    fields[2] = hdr.readIndex;
+    fields[3] = hdr.writeIndex;
+    fields[4] = hdr.senderReadyCount;
+    fields[5] = hdr.expectedSenders;
+    viewPtr[24] = hdr.shuttingDown;
+    viewPtr[25] = hdr.reserved[0];
+    viewPtr[26] = hdr.reserved[1];
+    viewPtr[27] = hdr.reserved[2];
 }
 
-bool SharedQueue::OpenSyncObjects(bool create, unsigned int capacity, unsigned int expectedSenders)
-{
-    std::string mutexName = MakeNamedObject(baseName_, "mtx");
-    std::string semEmptyName = MakeNamedObject(baseName_, "semEmpty");
-    std::string semFullName = MakeNamedObject(baseName_, "semFull");
-    std::string readyEventName = MakeNamedObject(baseName_, "allReady");
+bool SharedQueue::initSyncObjects(bool createNew, unsigned int capacity, unsigned int expectedSenders) {
+    std::string mutexName = buildObjectName(baseName, "mtx");
+    std::string emptyName = buildObjectName(baseName, "semEmpty");
+    std::string fullName = buildObjectName(baseName, "semFull");
+    std::string eventName = buildObjectName(baseName, "allReady");
 
-    if (create)
-    {
-        hMutex_ = CreateMutexA(NULL, FALSE, mutexName.c_str());
-        if (!hMutex_)
-        {
-            PrintLastErrorA("CreateMutex");
-            return false;
-        }
+    if (createNew) {
+        syncMutex = CreateMutexA(NULL, FALSE, mutexName.c_str());
+        if (!syncMutex) { PrintLastErrorA("CreateMutex"); return false; }
 
-        hSemEmpty_ = CreateSemaphoreA(NULL, capacity, capacity, semEmptyName.c_str());
-        if (!hSemEmpty_)
-        {
-            PrintLastErrorA("CreateSemaphore empty");
-            return false;
-        }
+        semFreeSlots = CreateSemaphoreA(NULL, capacity, capacity, emptyName.c_str());
+        if (!semFreeSlots) { PrintLastErrorA("CreateSemaphore empty"); return false; }
 
-        hSemFull_ = CreateSemaphoreA(NULL, 0, capacity, semFullName.c_str());
-        if (!hSemFull_)
-        {
-            PrintLastErrorA("CreateSemaphore full");
-            return false;
-        }
+        semUsedSlots = CreateSemaphoreA(NULL, 0, capacity, fullName.c_str());
+        if (!semUsedSlots) { PrintLastErrorA("CreateSemaphore full"); return false; }
 
-        hAllReadyEvent_ = CreateEventA(NULL, TRUE, FALSE, readyEventName.c_str());
-        if (!hAllReadyEvent_)
-        {
-            PrintLastErrorA("CreateEvent allReady");
-            return false;
-        }
+        allReadyEvent = CreateEventA(NULL, TRUE, FALSE, eventName.c_str());
+        if (!allReadyEvent) { PrintLastErrorA("CreateEvent allReady"); return false; }
 
-        QueueHeaderBinary hdr;
+        QueueHeader hdr;
         hdr.capacity = capacity;
         hdr.msgLen = MAX_MESSAGE_LEN;
         hdr.readIndex = 0;
@@ -210,237 +165,233 @@ bool SharedQueue::OpenSyncObjects(bool create, unsigned int capacity, unsigned i
         hdr.expectedSenders = expectedSenders;
         hdr.shuttingDown = 0;
         hdr.reserved[0] = hdr.reserved[1] = hdr.reserved[2] = 0;
-        WriteHeader(hdr);
+        writeHeader(hdr);
     }
-    else
-    {
-        hMutex_ = OpenMutexA(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, mutexName.c_str());
-        if (!hMutex_)
-        {
-            PrintLastErrorA("OpenMutex");
-            return false;
-        }
+    else {
+        syncMutex = OpenMutexA(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, mutexName.c_str());
+        if (!syncMutex) { PrintLastErrorA("OpenMutex"); return false; }
 
-        hSemEmpty_ = OpenSemaphoreA(SEMAPHORE_MODIFY_STATE | SYNCHRONIZE, FALSE, semEmptyName.c_str());
-        if (!hSemEmpty_)
-        {
-            PrintLastErrorA("OpenSemaphore empty");
-            return false;
-        }
+        semFreeSlots = OpenSemaphoreA(SEMAPHORE_MODIFY_STATE | SYNCHRONIZE, FALSE, emptyName.c_str());
+        if (!semFreeSlots) { PrintLastErrorA("OpenSemaphore empty"); return false; }
 
-        hSemFull_ = OpenSemaphoreA(SEMAPHORE_MODIFY_STATE | SYNCHRONIZE, FALSE, semFullName.c_str());
-        if (!hSemFull_)
-        {
-            PrintLastErrorA("OpenSemaphore full");
-            return false;
-        }
+        semUsedSlots = OpenSemaphoreA(SEMAPHORE_MODIFY_STATE | SYNCHRONIZE, FALSE, fullName.c_str());
+        if (!semUsedSlots) { PrintLastErrorA("OpenSemaphore full"); return false; }
 
-        hAllReadyEvent_ = OpenEventA(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, readyEventName.c_str());
-        if (!hAllReadyEvent_)
-        {
-            PrintLastErrorA("OpenEvent allReady");
-            return false;
-        }
+        allReadyEvent = OpenEventA(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, eventName.c_str());
+        if (!allReadyEvent) { PrintLastErrorA("OpenEvent allReady"); return false; }
     }
+
     return true;
 }
 
-bool SharedQueue::CreateAsReceiver(const std::string &fileName,
-                                   unsigned int capacity,
-                                   unsigned int expectedSenders)
-{
-    baseName_ = MakeObjectBaseName(fileName);
-    if (!MapFile(fileName, true, capacity))
+bool SharedQueue::CreateAsReceiver(const std::string& fileName,
+    unsigned int capacity,
+    unsigned int expectedSenders) {
+    baseName = sanitizeFileName(fileName);
+
+    if (!openMappedFile(fileName, true, capacity))
         return false;
-    if (!OpenSyncObjects(true, capacity, expectedSenders))
+
+    if (!initSyncObjects(true, capacity, expectedSenders))
         return false;
-    printf("[Receiver] Queue created: capacity=%u, senders=%u\n", capacity, expectedSenders);
+
+    printf("[Receiver] queue ready: capacity=%u, expected senders=%u\n",
+        capacity, expectedSenders);
     return true;
 }
 
-bool SharedQueue::OpenAsSender(const std::string &fileName)
-{
-    baseName_ = MakeObjectBaseName(fileName);
-    if (!MapFile(fileName, false, 0))
-        return false;
-    if (!OpenSyncObjects(false, 0, 0))
+bool SharedQueue::OpenAsSender(const std::string& fileName) {
+    baseName = sanitizeFileName(fileName);
+
+    if (!openMappedFile(fileName, false, 0))
         return false;
 
-    QueueHeaderBinary hdr;
-    ReadHeader(hdr);
-    if (hdr.msgLen != MAX_MESSAGE_LEN)
-    {
-        printf("[Sender] Incompatible message length\n");
+    if (!initSyncObjects(false, 0, 0))
+        return false;
+
+    QueueHeader hdr;
+    readHeader(hdr);
+    if (hdr.msgLen != MAX_MESSAGE_LEN) {
+        printf("[Sender] message length mismatch: expected %u, got %u\n",
+            MAX_MESSAGE_LEN, hdr.msgLen);
         return false;
     }
+
     return true;
 }
 
-bool SharedQueue::IsValid() const
-{
-    return baseView_ != NULL;
+bool SharedQueue::IsValid() const {
+    return viewPtr != NULL;
 }
 
-unsigned int SharedQueue::Capacity() const
-{
-    QueueHeaderBinary hdr;
-    ReadHeader(hdr);
+unsigned int SharedQueue::Capacity() const {
+    QueueHeader hdr;
+    readHeader(hdr);
     return hdr.capacity;
 }
-unsigned int SharedQueue::ReadIndex() const
-{
-    QueueHeaderBinary hdr;
-    ReadHeader(hdr);
+
+unsigned int SharedQueue::ReadIndex() const {
+    QueueHeader hdr;
+    readHeader(hdr);
     return hdr.readIndex;
 }
-unsigned int SharedQueue::WriteIndex() const
-{
-    QueueHeaderBinary hdr;
-    ReadHeader(hdr);
+
+unsigned int SharedQueue::WriteIndex() const {
+    QueueHeader hdr;
+    readHeader(hdr);
     return hdr.writeIndex;
 }
 
-bool SharedQueue::WaitAllSendersReady(DWORD timeoutMs)
-{
-    DWORD res = WaitForSingleObject(hAllReadyEvent_, timeoutMs);
-    if (res == WAIT_OBJECT_0)
+bool SharedQueue::WaitAllSendersReady(DWORD timeoutMs) {
+    DWORD result = WaitForSingleObject(allReadyEvent, timeoutMs);
+
+    if (result == WAIT_OBJECT_0)
         return true;
-    if (res == WAIT_TIMEOUT)
-        printf("[Receiver] Sender readiness wait timeout\n");
+
+    if (result == WAIT_TIMEOUT)
+        printf("[Receiver] timed out waiting for senders\n");
     else
         PrintLastErrorA("WaitAllSendersReady");
+
     return false;
 }
 
-bool SharedQueue::SignalSenderReady()
-{
-    DWORD waitRes = WaitForSingleObject(hMutex_, INFINITE);
-    if (waitRes != WAIT_OBJECT_0)
-    {
-        PrintLastErrorA("Mutex wait SignalSenderReady");
+bool SharedQueue::SignalSenderReady() {
+    if (WaitForSingleObject(syncMutex, INFINITE) != WAIT_OBJECT_0) {
+        PrintLastErrorA("Mutex wait in SignalSenderReady");
         return false;
     }
-    QueueHeaderBinary hdr;
-    ReadHeader(hdr);
+
+    QueueHeader hdr;
+    readHeader(hdr);
+
     hdr.senderReadyCount++;
     if (hdr.senderReadyCount == hdr.expectedSenders)
-    {
-        SetEvent(hAllReadyEvent_);
-    }
-    WriteHeader(hdr);
-    ReleaseMutex(hMutex_);
+        SetEvent(allReadyEvent);
+
+    writeHeader(hdr);
+    ReleaseMutex(syncMutex);
     return true;
 }
 
-void SharedQueue::SignalShutdown()
-{
-    if (!baseView_)
+void SharedQueue::SignalShutdown() {
+    if (viewPtr == NULL)
         return;
-    WaitForSingleObject(hMutex_, INFINITE);
-    QueueHeaderBinary hdr;
-    ReadHeader(hdr);
-    hdr.shuttingDown = 1;
-    WriteHeader(hdr);
-    ReleaseMutex(hMutex_);
 
-    ReleaseSemaphore(hSemFull_, hdr.capacity, NULL);
-    ReleaseSemaphore(hSemEmpty_, hdr.capacity, NULL);
-    SetEvent(hAllReadyEvent_);
+    WaitForSingleObject(syncMutex, INFINITE);
+
+    QueueHeader hdr;
+    readHeader(hdr);
+    hdr.shuttingDown = 1;
+    writeHeader(hdr);
+
+    unsigned int cap = hdr.capacity;
+    ReleaseMutex(syncMutex);
+
+    for (unsigned int i = 0; i < cap; i++) {
+        ReleaseSemaphore(semUsedSlots, 1, NULL);
+        ReleaseSemaphore(semFreeSlots, 1, NULL);
+    }
+
+    SetEvent(allReadyEvent);
 }
 
-bool SharedQueue::IsShuttingDown() const
-{
-    QueueHeaderBinary hdr;
-    ReadHeader(hdr);
+bool SharedQueue::IsShuttingDown() const {
+    QueueHeader hdr;
+    readHeader(hdr);
     return hdr.shuttingDown != 0;
 }
 
-bool SharedQueue::PopMessage(std::string &outMsg, bool verbose)
-{
+bool SharedQueue::PopMessage(std::string& outMsg, bool verbose) {
     outMsg.clear();
+
     if (!IsValid())
         return false;
 
-    DWORD wr = WaitForSingleObject(hSemFull_, INFINITE);
-    if (wr != WAIT_OBJECT_0)
-    {
-        PrintLastErrorA("Wait semFull");
+    DWORD waitResult = WaitForSingleObject(semUsedSlots, INFINITE);
+    if (waitResult != WAIT_OBJECT_0) {
+        PrintLastErrorA("WaitForSingleObject semUsedSlots");
         return false;
     }
 
-    WaitForSingleObject(hMutex_, INFINITE);
+    WaitForSingleObject(syncMutex, INFINITE);
 
-    QueueHeaderBinary hdr;
-    ReadHeader(hdr);
+    QueueHeader hdr;
+    readHeader(hdr);
 
-    if (hdr.shuttingDown && hdr.readIndex == hdr.writeIndex)
-    {
-        ReleaseMutex(hMutex_);
+    if (hdr.shuttingDown && hdr.readIndex == hdr.writeIndex) {
+        std::cout << "No messages";
+        ReleaseMutex(syncMutex);
         return false;
     }
 
-    unsigned int idx = hdr.readIndex % hdr.capacity;
-    const char *src = slots_[idx].data;
-    outMsg.assign(src);
+    unsigned int slotIndex = hdr.readIndex % hdr.capacity;
+    outMsg.assign(messageSlots[slotIndex].data);
 
     hdr.readIndex = (hdr.readIndex + 1) % hdr.capacity;
-    WriteHeader(hdr);
+    writeHeader(hdr);
 
-    ReleaseMutex(hMutex_);
-    ReleaseSemaphore(hSemEmpty_, 1, NULL);
+    ReleaseMutex(syncMutex);
+    ReleaseSemaphore(semFreeSlots, 1, NULL);
 
     if (verbose)
-    {
-        printf("[Receiver] Read message: '%s'\n", outMsg.c_str());
-    }
+        printf("[Receiver] got message: '%s'\n", outMsg.c_str());
+
     return true;
 }
 
-bool SharedQueue::PushMessage(const std::string &msg, bool verbose)
-{
+bool SharedQueue::PushMessage(const std::string& msg, bool verbose) {
     if (!IsValid())
         return false;
-    if (msg.size() >= MAX_MESSAGE_LEN)
-    {
-        printf("[Sender] Message too long (>= %u)\n", MAX_MESSAGE_LEN);
+
+    if (msg.size() >= MAX_MESSAGE_LEN) {
+        printf("[Sender] message too long (max %u characters)\n", MAX_MESSAGE_LEN);
         return false;
     }
 
-    DWORD wr = WaitForSingleObject(hSemEmpty_, INFINITE);
-    if (wr != WAIT_OBJECT_0)
-    {
-        PrintLastErrorA("Wait semEmpty");
+    for (;;) {
+        DWORD waitResult = WaitForSingleObject(semFreeSlots, 200);
+
+        if (waitResult == WAIT_OBJECT_0)
+            break;
+
+        if (waitResult == WAIT_TIMEOUT) {
+            if (IsShuttingDown())
+                return false;
+            continue;
+        }
+
+        PrintLastErrorA("WaitForSingleObject semFreeSlots");
         return false;
     }
 
-    DWORD mw = WaitForSingleObject(hMutex_, INFINITE);
-    if (mw != WAIT_OBJECT_0)
-    {
-        PrintLastErrorA("Mutex wait push");
+    if (WaitForSingleObject(syncMutex, INFINITE) != WAIT_OBJECT_0) {
+        PrintLastErrorA("Mutex wait in PushMessage");
         return false;
     }
 
-    QueueHeaderBinary hdr;
-    ReadHeader(hdr);
-    if (hdr.shuttingDown)
-    {
-        ReleaseMutex(hMutex_);
+    QueueHeader hdr;
+    readHeader(hdr);
+
+    if (hdr.shuttingDown) {
+        ReleaseMutex(syncMutex);
         return false;
     }
 
-    unsigned int idx = hdr.writeIndex % hdr.capacity;
-    std::fill(slots_[idx].data, slots_[idx].data + MAX_MESSAGE_LEN, '\0');
-    std::copy(msg.begin(), msg.end(), slots_[idx].data);
+    unsigned int slotIndex = hdr.writeIndex % hdr.capacity;
+    std::fill(messageSlots[slotIndex].data,
+        messageSlots[slotIndex].data + MAX_MESSAGE_LEN,
+        '\0');
+    std::copy(msg.begin(), msg.end(), messageSlots[slotIndex].data);
 
     hdr.writeIndex = (hdr.writeIndex + 1) % hdr.capacity;
-    WriteHeader(hdr);
+    writeHeader(hdr);
 
-    ReleaseMutex(hMutex_);
-    ReleaseSemaphore(hSemFull_, 1, NULL);
+    ReleaseMutex(syncMutex);
+    ReleaseSemaphore(semUsedSlots, 1, NULL);
 
     if (verbose)
-    {
-        printf("[Sender] Sent message: '%s'\n", msg.c_str());
-    }
+        printf("[Sender] sent message: '%s'\n", msg.c_str());
+
     return true;
 }

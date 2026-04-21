@@ -1,15 +1,14 @@
-#include "headers/sharedQueue.h"
+#include "SharedQueue.h"
 #include <iostream>
 #include <string>
 #include <vector>
+#include <thread>
 
-static unsigned int to_uint(const std::string &s)
-{
-    return static_cast<unsigned int>(atoi(s.c_str()));
+static unsigned int parseUnsigned(const std::string& s) {
+    return static_cast<unsigned int>(std::stoi(s));
 }
 
-int main()
-{
+int main() {
     std::cout << "=== Receiver ===\n";
 
     std::cout << "Input binary file name: ";
@@ -19,83 +18,116 @@ int main()
     std::cout << "Input records count (capacity): ";
     std::string tmp;
     std::getline(std::cin, tmp);
-    unsigned int capacity = to_uint(tmp);
+    unsigned int capacity = parseUnsigned(tmp);
 
     std::cout << "Input desired Sender process count: ";
     std::getline(std::cin, tmp);
-    unsigned int senderCount = to_uint(tmp);
+    unsigned int senderCount = parseUnsigned(tmp);
 
-    if (capacity == 0 || senderCount == 0)
-    {
+    if (capacity == 0 || senderCount == 0) {
         std::cerr << "Capacity and sender count must be > 0.\n";
         return 1;
     }
 
     SharedQueue queue;
-    if (!queue.CreateAsReceiver(fileName, capacity, senderCount))
-    {
-        std::cerr << "Error creating queue.\n";
+    if (!queue.CreateAsReceiver(fileName, capacity, senderCount)) {
+        std::cerr << "Failed to initialize the message queue.\n";
         return 1;
     }
 
-    std::cout << "Launching " << senderCount << " instance(s) of sender process...\n";
-    for (unsigned int i = 0; i < senderCount; ++i)
-    {
-        std::string cmd = "\".\\sender.exe\" \"" + fileName + "\"";
+    char selfPath[MAX_PATH];
+    GetModuleFileNameA(NULL, selfPath, MAX_PATH);
+    std::string exeDir = selfPath;
+    size_t lastSlash = exeDir.find_last_of("\\/");
+    if (lastSlash != std::string::npos)
+        exeDir = exeDir.substr(0, lastSlash + 1);
+
+    std::cout << "Launching " << senderCount << " sender process(es)...\n";
+
+    std::vector<HANDLE> senderProcesses;
+
+    for (unsigned int i = 0; i < senderCount; i++) {
+        std::string cmdLine = "\"" + exeDir + "sender.exe\" \"" + fileName + "\"";
 
         STARTUPINFOA si;
         ZeroMemory(&si, sizeof(si));
         si.cb = sizeof(si);
+
         PROCESS_INFORMATION pi;
         ZeroMemory(&pi, sizeof(pi));
 
-        std::vector<char> buf(cmd.begin(), cmd.end());
+        std::vector<char> buf(cmdLine.begin(), cmdLine.end());
         buf.push_back('\0');
 
-        if (!CreateProcessA(NULL, &buf[0], NULL, NULL, FALSE,
-                            CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi))
-        {
-            PrintLastErrorA("CreateProcess sender");
+        BOOL ok = CreateProcessA(
+            NULL, buf.data(),
+            NULL, NULL,
+            FALSE, CREATE_NEW_CONSOLE,
+            NULL, NULL,
+            &si, &pi
+        );
+
+        if (!ok) {
+            PrintLastErrorA("CreateProcess");
         }
-        else
-        {
+        else {
             CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
+            senderProcesses.push_back(pi.hProcess);
         }
     }
 
-    std::cout << "Waiting for all Senders to be ready...\n";
+    std::cout << "Waiting for all senders to become ready...\n";
     queue.WaitAllSendersReady(INFINITE);
-    std::cout << "All Senders ready. Commands: r - read, q - quit.\n";
+    std::cout << "All senders ready. Commands: r - read message, q - quit.\n";
+    std::cout << "[Receiver] command (r/q): ";
 
-    while (true)
-    {
-        std::cout << "[Receiver] Command (r/q): ";
-        std::string cmdLine;
-        if (!std::getline(std::cin, cmdLine))
-            break;
+    std::thread watcher([&senderProcesses, &queue]() {
+        if (senderProcesses.empty()) return;
 
-        if (cmdLine == "r")
-        {
+        WaitForMultipleObjects(
+            (DWORD)senderProcesses.size(),
+            senderProcesses.data(),
+            TRUE,
+            INFINITE
+        );
+
+        if (!queue.IsShuttingDown()) {
+            std::cout << "\n[Receiver] all senders have exited. Shutting down.\n";
+            queue.SignalShutdown();
+            CloseHandle(GetStdHandle(STD_INPUT_HANDLE));
+        }
+        });
+    watcher.detach();
+
+    std::string command;
+    while (std::getline(std::cin, command)) {
+        if (command == "r") {
             std::string msg;
-            if (!queue.PopMessage(msg, true))
-            {
-                if (queue.IsShuttingDown())
-                    std::cout << "[Receiver] Quitting...\n";
-                else
-                    std::cout << "[Receiver] No messages\n";
+            bool ok = queue.PopMessage(msg, true);
+            if (!ok) {
+                if (queue.IsShuttingDown()) {
+                    std::cout << "[Receiver] shutting down.\n";
+                    break;
+                }
+                std::cout << "[Receiver] no messages available.\n";
             }
         }
-        else if (cmdLine == "q")
-        {
-            std::cout << "[Receiver] Finishing. shutdown signal.\n";
+        else if (command == "q") {
+            std::cout << "[Receiver] sending shutdown signal.\n";
             queue.SignalShutdown();
             break;
         }
-        else
-        {
-            std::cout << "Unknown command.\n";
+        else {
+            std::cout << "Unknown command. Use r or q.\n";
         }
+
+        if (queue.IsShuttingDown()) break;
+
+        std::cout << "[Receiver] command (r/q): ";
     }
+
+    for (size_t i = 0; i < senderProcesses.size(); i++)
+        CloseHandle(senderProcesses[i]);
+
     return 0;
 }
